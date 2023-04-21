@@ -173,14 +173,14 @@ def lora_interpreter(jaxpr, args, literals):
             return None
 
         lhs_arg = args.get(lhs)
-        if lhs_arg:
+        if isinstance(lhs_arg, tuple):
             frozen, lora = lhs_arg
             use_lhs = isinstance(lora, LoraNode)
         else:
             use_lhs = False
 
         rhs_arg = args.get(rhs)
-        if rhs_arg:
+        if isinstance(rhs_arg, tuple):
             use_rhs = isinstance(rhs_arg[1], LoraNode)
             if use_rhs:
                 if use_lhs:
@@ -312,8 +312,6 @@ def lora_interpreter(jaxpr, args, literals):
         elif eqn.primitive.name == 'gather':
             ans = eval_lora_gather(eqn)
             used_lora = ans is not None
-        print(eqn)
-        print(eqn.primitive.name, used_lora)
 
         if not used_lora:
             ans = eqn.primitive.bind(*subfuns, *map(read, eqn.invars), **bind_params)
