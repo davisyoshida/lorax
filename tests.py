@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 import haiku as hk
@@ -66,7 +68,7 @@ def test_simple():
     assert jnp.allclose(perturbed_lora, combined_output, rtol=1e-4)
 
 def test_conv():
-    key, a_key, b_key= jax.random.split(jax.random.PRNGKey(18), 3)
+    key, a_key, b_key = jax.random.split(jax.random.PRNGKey(18), 3)
     batch = 7
     time = 11
     hidden = 13
@@ -88,10 +90,10 @@ def test_conv():
             padding='VALID'
         )
 
-    a = jax.random.normal(a_key, (window_size, hidden, rank_constraint))
-    b = jax.random.normal(b_key, (1, rank_constraint, output))
+    a = jax.random.normal(b_key, (1, rank_constraint, output))
+    b = jax.random.normal(a_key, (window_size, hidden, rank_constraint))
 
-    w = a @ b
+    w = b @ a
 
     lora_params = (
         jnp.zeros((window_size, hidden, output)),
@@ -104,4 +106,45 @@ def test_conv():
     print(f'Orig: {orig_result[:3, :3, :3]}')
     print(f'Lora: {lora_result[:3, :3, :3]}')
 
-    assert jnp.allclose(orig_result, lora_result, rtol=1e-3) #???
+    assert jnp.allclose(orig_result, lora_result, rtol=1e-3)
+
+def test_embedding():
+    key, a_key, b_key = jax.random.split(jax.random.PRNGKey(19), 3)
+    batch = 11
+    time = 13
+    vocab = 4321
+    hidden = 100
+
+    rank_constraint = 19
+
+    ids = jax.random.randint(key, (batch, time), 0, vocab)
+
+    a = jax.random.normal(b_key, (rank_constraint, hidden))
+    b = jax.random.normal(a_key, (vocab, rank_constraint))
+
+    def f(w, x):
+        return jax.lax.gather(
+            w,
+            x[:, :, None],
+            dimension_numbers=jax.lax.GatherDimensionNumbers(
+                offset_dims=(2,),
+                collapsed_slice_dims=(0,),
+                start_index_map=(0,),
+            ),
+            mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+            slice_sizes=(1, hidden)
+        )
+
+    w = b @ a
+    jaxpr = jax.make_jaxpr(f)(w, ids)
+    lora_params = (
+        jnp.zeros((vocab, hidden)),
+        transform.LoraNode(a, b)
+    )
+
+    lora_f = lora(f)
+
+    orig_result = f(w, ids)
+    lora_result = lora_f(lora_params, ids)
+
+    assert jnp.allclose(orig_result, lora_result, rtol=1e-4)
