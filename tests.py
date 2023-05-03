@@ -1,12 +1,25 @@
-import warnings
-
+import haiku as hk
 import jax
 import jax.numpy as jnp
-import haiku as hk
+import pytest
 
 from lorax import transform
 from lorax.constants import LORA_FULL, LORA_FREEZE
 from lorax.transform import init_lora, lora
+
+@pytest.fixture
+def simple_params():
+    m, rank_constraint, n = 11, 7, 19
+    x = jax.random.normal(jax.random.PRNGKey(0), (n, 10))
+
+    a = jax.random.normal(jax.random.PRNGKey(1), (rank_constraint, n))
+    b = jax.random.normal(jax.random.PRNGKey(2), (m, rank_constraint))
+    w = b @ a
+    lora_params = (
+        jnp.zeros((m, n)),
+        transform.LoraNode(a, b)
+    )
+    return w, x, lora_params
 
 def test_prepare():
     w_shape = 3, 4
@@ -148,3 +161,39 @@ def test_embedding():
     lora_result = lora_f(lora_params, ids)
 
     assert jnp.allclose(orig_result, lora_result, rtol=1e-4)
+
+def test_einsum(simple_params):
+    w, x, lora_params = simple_params
+
+    def f(w, x):
+        return jnp.einsum('ij,jk->ik', w, x)
+
+    expected = f(w, x)
+
+    lora_f = lora(f)
+    result = lora_f(lora_params, x)
+    assert jnp.allclose(expected, result, rtol=1e-4)
+
+def test_remat(simple_params):
+    w, x, lora_params = simple_params
+
+    h = jax.random.normal(jax.random.PRNGKey(0), (x.shape[1],))
+    def f(w, x):
+        return w @ x + h
+
+    f = jax.remat(f)
+    lora_f = jax.jit(lora(f))
+
+    expected = f(w, x)
+    res = lora_f(lora_params, x)
+    assert jnp.allclose(expected, res, rtol=1e-4)
+
+def test_warning(simple_params):
+    w, x, lora_params = simple_params
+    def f(w):
+        return w + w
+
+    lora_f = lora(f)
+
+    with pytest.warns(UserWarning, match='materialized'):
+        lora_f(lora_params)

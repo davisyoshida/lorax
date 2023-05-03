@@ -1,6 +1,7 @@
 from functools import partial, wraps
 from itertools import chain, repeat
 import logging
+import warnings
 
 import jax
 from jax import api_util
@@ -10,8 +11,6 @@ from  jax.util import safe_map
 
 LORA_FREEZE = 0
 LORA_FULL = -1
-
-logger = logging.getLogger(__name__)
 
 class LoraNode:
     def __init__(self, a, b):
@@ -57,7 +56,7 @@ def lora_to_orig(freeze_param, tune_param):
         return tune_param
     return freeze_param
 
-def init_lora(param_tree, spec, rng, stddev=0.01):
+def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
     def freeze_getter(param, spec_val):
         if spec_val == LORA_FULL:
             return EmptyNode
@@ -100,8 +99,12 @@ def lora(f, argnums=0):
             orig_args[argnum] = custom_tree_map(lora_to_orig, *args[argnum])
             assert not any(node is EmptyNode for node in custom_tree_leaves(orig_args[argnum]))
 
-        closed_jaxpr = jax.make_jaxpr(f)(*orig_args, **kwargs)
-        out_shape = jax.eval_shape(f, *orig_args, **kwargs)
+        shape_args, shape_kwargs = jax.tree_map(
+            lambda x: jax.core.get_aval(x) if isinstance(x, jax.core.Tracer) else x, 
+            (orig_args, kwargs)
+        )
+        closed_jaxpr = jax.make_jaxpr(f)(*shape_args, **shape_kwargs)
+        out_shape = jax.eval_shape(f, *shape_args, **shape_kwargs)
         out_structure = jax.tree_util.tree_structure(out_shape)
 
         jaxpr = closed_jaxpr.jaxpr
@@ -148,8 +151,7 @@ def lora_interpreter(jaxpr, args, literals):
         if tune is EmptyNode:
             return freeze
 
-        logger.warning('LoRA matrix was materialized')
-        raise ValueError
+        warnings.warn('LoRA matrix was materialized')
         return tune.b @ tune.a + freeze
 
     def write(var, val):
@@ -166,10 +168,10 @@ def lora_interpreter(jaxpr, args, literals):
         dimension_numbers = eqn.params['dimension_numbers']
         (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
         if lhs_batch or rhs_batch:
-            logger.warning('Lorax does not support batched matmuls')
+            warnings.warn('Lorax does not support batched matmuls')
             return None
         if len(lhs_contract) != 1 or len(rhs_contract) != 1:
-            logger.warning('Lorax only supports matmul')
+            warnings.warn('Lorax only supports matmul')
             return None
 
         lhs_arg = args.get(lhs)
@@ -184,7 +186,7 @@ def lora_interpreter(jaxpr, args, literals):
             use_rhs = isinstance(rhs_arg[1], LoraNode)
             if use_rhs:
                 if use_lhs:
-                    logger.warning('Product of two LoRA matrices is not implemented so RHS was materialized')
+                    warnings.warn('Product of two LoRA matrices is not implemented so RHS was materialized')
                     use_rhs = False
                 else:
                     frozen, lora = rhs_arg
@@ -199,7 +201,6 @@ def lora_interpreter(jaxpr, args, literals):
 
 
         fn = jax.lax.dot_general if use_lhs else reversed_dot
-        logger.info('Evaluating %s with dimension_numbers %s', fn, dimension_numbers)
         orig_product = fn(
             frozen,
             fixed_arg,
@@ -207,15 +208,12 @@ def lora_interpreter(jaxpr, args, literals):
         )
 
         first, second = (lora.a, lora.b) if a_first else (lora.b, lora.a)
-        logger.info(f'a_first: {a_first} a: {lora.a.shape} b: {lora.b.shape}')
-        logger.info(f'First: {first.shape} Fixed: {fixed_arg.shape}')
         lora_product = fn(
             first,
             fixed_arg,
             dimension_numbers=dimension_numbers
         )
 
-        logger.info(f'Second: {second.shape} Lora: {lora_product.shape}')
         lora_product = fn(
             second,
             lora_product,
@@ -288,20 +286,37 @@ def lora_interpreter(jaxpr, args, literals):
         lora_product = lora_product @ lora.a
         return orig + lora_product
 
+    def get_args_for_sub_fn(eqn_invars, jaxpr_invars):
+        result = {}
+        for outer_arg, inner_arg in zip(eqn_invars, jaxpr_invars):
+            if outer_arg in env:
+                result[inner_arg] = env[outer_arg]
+            else:
+                result[inner_arg] = args[outer_arg]
+
+        return result
+
     for eqn in jaxpr.eqns:
+        # TODO: run inside other interpreters in a smarter way
         used_lora = False
         subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
         if eqn.primitive.name == 'pjit' and eqn.params['name'] == '_einsum':
-            params = eqn.params
-            pjit_jaxpr = params.pop('jaxpr').jaxpr
-            sub_fn_inputs = {}
-            for outer_arg, inner_arg in zip(eqn.invars, pjit_jaxpr.invars):
-                if outer_arg in env:
-                    sub_fn_inputs[inner_arg] = env[outer_arg]
-                else:
-                    sub_fn_inputs[inner_arg] = args[outer_arg]
+            params = dict(eqn.params)
+            pjit_jaxpr = params.pop('jaxpr')
+            literals = pjit_jaxpr.literals
+            subjaxpr = pjit_jaxpr.jaxpr
+            sub_fn_inputs = get_args_for_sub_fn(eqn.invars, subjaxpr.invars)
 
-            ans = lora_interpreter(pjit_jaxpr, sub_fn_inputs, [])
+            ans = jax.experimental.pjit.pjit(
+                partial(lora_interpreter, subjaxpr),
+            )(sub_fn_inputs, literals)
+            used_lora = True
+        elif eqn.primitive.name == 'remat2':
+            sub_jaxpr = eqn.params['jaxpr']
+            sub_fn_inputs = get_args_for_sub_fn(eqn.invars, sub_jaxpr.invars)
+            ans = jax.remat(
+                partial(lora_interpreter, sub_jaxpr)
+            )(sub_fn_inputs, [])
             used_lora = True
         elif eqn.primitive.name == 'dot_general':
             ans = eval_lora(eqn)
