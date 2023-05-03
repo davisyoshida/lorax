@@ -2,6 +2,7 @@ import jax
 from jax.tree_util import tree_map_with_path, DictKey
 
 from lorax.constants import LORA_FREEZE, LORA_FULL
+from lorax.transform import EmptyNode
 
 def simple_spec(params, decision_fn=None, tune_vectors=False):
     """
@@ -18,13 +19,25 @@ def simple_spec(params, decision_fn=None, tune_vectors=False):
         def decision_fn(*args):
             return LORA_FREEZE
 
-    def fulL_fn(path, arr):
-        if tune_vectors and len(arr.shape) < 2:
-            return LORA_FULL
+    def full_fn(path, arr):
+        if len(arr.shape) < 2:
+            return LORA_FULL if tune_vectors else LORA_FREEZE
 
         path_str = '/'.join(str(node.key if isinstance(node, DictKey) else node.idx) for node in path)
         value = decision_fn(path_str, arr)
         return value
 
-    return tree_map_with_path(fulL_fn, params)
+    return tree_map_with_path(full_fn, params)
 
+def merge_params(frozen_params, tunable_params, destructive=True):
+    """Re-merge LoRA parameters. If destructive=True is set, buffers in frozen_params may be freed to save memory."""
+    def merge(frozen, tunable):
+        if tunable is EmptyNode:
+            return frozen
+        elif frozen is EmptyNode:
+            return tunable
+        new_param = frozen + tunable.b @ tunable.a
+        if destructive:
+            frozen.device_buffer.delete()
+        return new_param
+    return jax.tree_map(merge, frozen_params, tunable_params)

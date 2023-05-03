@@ -62,12 +62,14 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
             return EmptyNode
         return param
 
-    def tune_getter(param, spec_val):
+    def tune_getter(path, param, spec_val):
         if spec_val == LORA_FREEZE:
             return EmptyNode
         if spec_val == LORA_FULL:
             return param
 
+        if len(param.shape) == 1:
+            raise ValueError(f'Vectors must either be frozen or fully tuned, but got spec value {spec} for param with path {path}')
         if len(param.shape) == 2:
             b_dim, a_dim = param.shape
 
@@ -76,6 +78,7 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
             return LoraNode(a, b)
 
         # conv case
+        print(path, param.shape)
         *window_shape, in_channels, out_channels = param.shape
 
         a = jnp.zeros((
@@ -86,7 +89,7 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
         b = jax.random.normal(rng, (*window_shape, in_channels, spec_val), dtype=param.dtype) * stddev
         return LoraNode(a, b)
 
-    return jax.tree_map(freeze_getter, param_tree, spec), jax.tree_map(tune_getter, param_tree, spec)
+    return jax.tree_map(freeze_getter, param_tree, spec), jax.tree_util.tree_map_with_path(tune_getter, param_tree, spec)
 
 def lora(f, argnums=0):
     if isinstance(argnums, int):
@@ -335,19 +338,6 @@ def lora_interpreter(jaxpr, args, literals):
         safe_map(write, eqn.outvars, ans)
 
     return safe_map(read, jaxpr.outvars)
-
-def merge_params(frozen_tree, tune_tree):
-    def merge(frozen, tune):
-        if isinstance(tune, LoraNode):
-            tune = tune.b @ tune.a
-
-        if tune is EmptyNode:
-            return frozen
-        if frozen is EmptyNode:
-            return tune
-        return tune + frozen
-
-    return jax.tree_map(merge, frozen_tree, tune_tree)
 
 def f(params, x):
     res = jnp.einsum('ij,klj->kli', params['W'], x)

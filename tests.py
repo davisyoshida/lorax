@@ -3,9 +3,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from lorax import transform
+from lorax import merge_params, lora, init_lora
 from lorax.constants import LORA_FULL, LORA_FREEZE
-from lorax.transform import init_lora, lora
+from lorax.transform import LoraNode, EmptyNode
 
 @pytest.fixture
 def simple_params():
@@ -17,7 +17,7 @@ def simple_params():
     w = b @ a
     lora_params = (
         jnp.zeros((m, n)),
-        transform.LoraNode(a, b)
+        LoraNode(a, b)
     )
     return w, x, lora_params
 
@@ -38,13 +38,13 @@ def test_prepare():
 
     assert frozen_params['W'].shape == params['W'].shape
     assert frozen_params['b'].shape == params['b'].shape
-    assert frozen_params['W2'] is transform.EmptyNode
+    assert frozen_params['W2'] is EmptyNode
 
-    assert isinstance(tune_params['W'], transform.LoraNode)
+    assert isinstance(tune_params['W'], LoraNode)
     assert tune_params['W'].a.shape == (2, w_shape[1])
     assert tune_params['W'].b.shape == (w_shape[0], 2)
 
-    assert tune_params['b'] is transform.EmptyNode
+    assert tune_params['b'] is EmptyNode
     assert tune_params['W2'].shape == params['W2'].shape
 
 def test_simple():
@@ -75,7 +75,7 @@ def test_simple():
 
     perturbed_lora = lora_f(lora_params, x)
 
-    combined_params = transform.merge_params(*lora_params)
+    combined_params = merge_params(*lora_params)
     combined_output = f(combined_params, x)
 
     assert jnp.allclose(perturbed_lora, combined_output, rtol=1e-4)
@@ -110,7 +110,7 @@ def test_conv():
 
     lora_params = (
         jnp.zeros((window_size, hidden, output)),
-        transform.LoraNode(a, b)
+        LoraNode(a, b)
     )
 
     lora_fn = lora(fn)
@@ -152,7 +152,7 @@ def test_embedding():
     jaxpr = jax.make_jaxpr(f)(w, ids)
     lora_params = (
         jnp.zeros((vocab, hidden)),
-        transform.LoraNode(a, b)
+        LoraNode(a, b)
     )
 
     lora_f = lora(f)
@@ -160,7 +160,9 @@ def test_embedding():
     orig_result = f(w, ids)
     lora_result = lora_f(lora_params, ids)
 
-    assert jnp.allclose(orig_result, lora_result, rtol=1e-4)
+    gap = jnp.max(jnp.abs(orig_result - lora_result))
+    print(f'Gap: {gap:.3e}')
+    assert jnp.allclose(orig_result, lora_result, atol=1e-5)
 
 def test_einsum(simple_params):
     w, x, lora_params = simple_params
