@@ -80,7 +80,7 @@ opt_state = optimizer.init(tunable_params)
 ```
 
 Now for some dummy data and the training loop:
-```
+```python
 x = jax.random.normal(jax.random.PRNGKey(0), (dim,))
 for i in range(10):
     loss, opt_state, tunable_params = update_fn(frozen_params, tunable_params, opt_state, x)
