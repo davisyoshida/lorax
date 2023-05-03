@@ -338,27 +338,3 @@ def lora_interpreter(jaxpr, args, literals):
         safe_map(write, eqn.outvars, ans)
 
     return safe_map(read, jaxpr.outvars)
-
-def f(params, x):
-    res = jnp.einsum('ij,klj->kli', params['W'], x)
-    return res + params['b'][None, None]
-
-lora_f = lora(f)
-
-def main():
-    from pprint import pprint
-    W = jnp.array([[1., 2], [3, 4]])
-    x = jnp.arange(30).reshape(3, 5, 2).astype(jnp.float32)
-    params = {'W': W, 'b': jnp.ones(2)}
-    rng = jax.random.PRNGKey(0)
-    lora_params = init_lora(params, {'W': 2, 'b': LORA_FULL}, rng)
-    pprint(lora_params)
-    print(f'Orig: {f(params, x)}')
-    print(f'Lora: {lora_f(lora_params, x)}')
-
-    jaxpr = jax.make_jaxpr(jax.jit(lora_f))(lora_params, x)
-    pprint(jaxpr)
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    main()
