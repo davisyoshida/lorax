@@ -3,7 +3,15 @@ This is a JAX transform which implements [LoRA: Low-Rank Adaptation of Large Lan
 
 Lorax should work on most JAX models. I did my testing with my models which use Haiku, and you can find an example of applying it to a HuggingFace Flax model in the [examples directory(examples/).
 
-## Simple example
+## Installation 
+
+```bash
+git clone https://github.com/davisyoshida/lorax.git
+cd lorax
+pip install -e .
+```
+
+## Minimal example
 Lorax makes it so you can take model code which wasn't written with LoRA in mind, and transform it so that it does! For example, consider the following MLP code:
 
 ```python
