@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax.tree_util import tree_map_with_path, DictKey
+from jax.tree_util import tree_map_with_path, DictKey, SequenceKey
 
 from .constants import LORA_FREEZE, LORA_FULL
 from .transform import EmptyNode, LoraNode, custom_tree_map
@@ -59,7 +59,15 @@ def simple_spec(params, decision_fn=None, tune_vectors=False):
         if len(arr.shape) < 2:
             return LORA_FULL if tune_vectors else LORA_FREEZE
 
-        path_str = '/'.join(str(node.key if isinstance(node, DictKey) else node.idx) for node in path)
+        path_str = '/'.join(
+            str(node.key
+                if isinstance(node, DictKey) else
+                node.idx
+                if isinstance(node, SequenceKey)
+                else
+                str(node)
+            ) for node in path
+        )
         value = decision_fn(path_str, arr)
         return value
 
