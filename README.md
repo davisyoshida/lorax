@@ -94,7 +94,7 @@ for i in range(10):
 # Step: 6 loss: 6.0599e-03
 # Step: 7 loss: 4.3899e-03
 # Step: 8 loss: 3.0839e-03
- 3Step: 9 loss: 2.2423e-03
+# Step: 9 loss: 2.2423e-03
 ```
 
 Number goes down! We can now merge the trained LoRA params with the frozen params, and use them with the unmodified model:
