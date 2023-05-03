@@ -1,3 +1,4 @@
+from itertools import product
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -213,8 +214,48 @@ def test_transpose(simple_params):
     res = lora_f(lora_params, x)
     assert jnp.allclose(expected, res, rtol=1e-4)
 
+@pytest.mark.parametrize('lora_first,contract_lora,contract_x,x_ndim', [
+    (lf, cl, cx, nd) for lf, cl, cx, nd in
+    product([True, False], [0, 1], [0, 1, 2], [2, 3])
+    if cx < nd
+])
+def test_dot_contraction(simple_params, lora_first, contract_lora, contract_x, x_ndim):
+    w, _, lora_params = simple_params
+    def f(w, x):
+        lhs = w
+        rhs = x
+        lhs_contract = contract_lora
+        rhs_contract = contract_x
+        if not lora_first:
+            lhs_contract, rhs_contract = rhs_contract, lhs_contract
+            lhs, rhs = rhs, lhs
+
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            (((lhs_contract,), (rhs_contract,)), ((), ()))
+        )
+
+    x_shape = [23]
+    if x_ndim == 3:
+        x_shape.append(29)
+
+    contract_size = w.shape[contract_lora]
+    x_shape.insert(contract_x, contract_size)
+
+    x = jax.random.normal(jax.random.PRNGKey(0), x_shape)
+
+    expected = f(w, x)
+
+    lora_f = lora(f)
+    lora_result = lora_f(lora_params, x)
+
+    print(f'Gap: {jnp.max(jnp.abs(expected - lora_result)):.3e}')
+    assert jnp.allclose(expected, lora_result, atol=1e-5)
+
+
 def test_warning(simple_params):
-    w, x, lora_params = simple_params
+    _, _, lora_params = simple_params
     def f(w):
         return w + w
 

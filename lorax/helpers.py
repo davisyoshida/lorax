@@ -1,8 +1,44 @@
 import jax
+import jax.numpy as jnp
 from jax.tree_util import tree_map_with_path, DictKey
 
 from .constants import LORA_FREEZE, LORA_FULL
 from .transform import EmptyNode, LoraNode, custom_tree_map
+
+def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
+    def freeze_getter(param, spec_val):
+        if spec_val == LORA_FULL:
+            return EmptyNode
+        return param
+
+    def tune_getter(path, param, spec_val):
+        if spec_val == LORA_FREEZE:
+            return EmptyNode
+        if spec_val == LORA_FULL:
+            return param
+
+        if len(param.shape) == 1:
+            raise ValueError(f'Vectors must either be frozen or fully tuned, but got spec value {spec} for param with path {path}')
+        if len(param.shape) == 2:
+            b_dim, a_dim = param.shape
+
+            b = jnp.zeros((b_dim, spec_val), dtype=param.dtype)
+            a = jax.random.normal(rng, (spec_val, a_dim), dtype=param.dtype) * stddev
+            return LoraNode(a, b)
+
+        # conv case
+        print(path, param.shape)
+        *window_shape, in_channels, out_channels = param.shape
+
+        a = jnp.zeros((
+            *(1 for _ in range(len(window_shape))),
+            spec_val,
+            out_channels
+        ), dtype=param.dtype)
+        b = jax.random.normal(rng, (*window_shape, in_channels, spec_val), dtype=param.dtype) * stddev
+        return LoraNode(a, b)
+
+    return jax.tree_map(freeze_getter, param_tree, spec), jax.tree_util.tree_map_with_path(tune_getter, param_tree, spec)
 
 def simple_spec(params, decision_fn=None, tune_vectors=False):
     """

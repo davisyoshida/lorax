@@ -9,8 +9,9 @@ import jax.linear_util as lu
 import jax.numpy as jnp
 from  jax.util import safe_map
 
-LORA_FREEZE = 0
-LORA_FULL = -1
+from .constants import LORA_FREEZE, LORA_FULL
+
+LORA_IMPLS = {}
 
 class LoraNode:
     def __init__(self, a, b):
@@ -44,53 +45,10 @@ def leaf_pred(x):
 custom_tree_map = partial(jax.tree_util.tree_map, is_leaf=leaf_pred)
 custom_tree_leaves = partial(jax.tree_util.tree_leaves, is_leaf=leaf_pred)
 
-def reversed_dot(lhs, rhs, dimension_numbers):
-    return jax.lax.dot_general(
-        rhs,
-        lhs,
-        dimension_numbers
-
-    )
-
 def lora_to_orig(freeze_param, tune_param):
     if freeze_param is EmptyNode:
         return tune_param
     return freeze_param
-
-def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32):
-    def freeze_getter(param, spec_val):
-        if spec_val == LORA_FULL:
-            return EmptyNode
-        return param
-
-    def tune_getter(path, param, spec_val):
-        if spec_val == LORA_FREEZE:
-            return EmptyNode
-        if spec_val == LORA_FULL:
-            return param
-
-        if len(param.shape) == 1:
-            raise ValueError(f'Vectors must either be frozen or fully tuned, but got spec value {spec} for param with path {path}')
-        if len(param.shape) == 2:
-            b_dim, a_dim = param.shape
-
-            b = jnp.zeros((b_dim, spec_val), dtype=param.dtype)
-            a = jax.random.normal(rng, (spec_val, a_dim), dtype=param.dtype) * stddev
-            return LoraNode(a, b)
-
-        # conv case
-        print(path, param.shape)
-        *window_shape, in_channels, out_channels = param.shape
-
-        a = jnp.zeros((
-            *(1 for _ in range(len(window_shape))),
-            spec_val,
-            out_channels
-        ), dtype=param.dtype)
-        b = jax.random.normal(rng, (*window_shape, in_channels, spec_val), dtype=param.dtype) * stddev
-        return LoraNode(a, b)
-
-    return jax.tree_map(freeze_getter, param_tree, spec), jax.tree_util.tree_map_with_path(tune_getter, param_tree, spec)
 
 def lora(f, argnums=0):
     if isinstance(argnums, int):
@@ -111,16 +69,7 @@ def lora(f, argnums=0):
         out_shape = jax.eval_shape(f, *shape_args, **shape_kwargs)
         out_structure = jax.tree_util.tree_structure(out_shape)
 
-        jaxpr = closed_jaxpr.jaxpr
-
-        arg_offsets = []
-        curr = 0
-        for tree in orig_args:
-            arg_offsets.append(curr)
-            curr += curr + len(jax.tree_util.tree_leaves(tree))
-
-        lora_arg_vals = {}
-        inp_iter = iter(jaxpr.invars)
+        paired_args = []
         for i, arg in enumerate(args):
             if i in argnums:
                 frozen_leaves, lora_leaves = (custom_tree_leaves(a) for a in arg)
@@ -128,10 +77,14 @@ def lora(f, argnums=0):
                 frozen_leaves = repeat(EmptyNode)
                 lora_leaves = jax.tree_util.tree_leaves(arg)
 
-            for (frozen_leaf, lora_leaf, name) in zip(frozen_leaves, lora_leaves, inp_iter):
-                lora_arg_vals[name] = (frozen_leaf, lora_leaf)
+            for frozen_leaf, lora_leaf in zip(frozen_leaves, lora_leaves):
+                paired_args.append((frozen_leaf, lora_leaf))
 
-        result = lora_interpreter(jaxpr, lora_arg_vals, closed_jaxpr.literals)
+        paired_args.extend((EmptyNode, leaf) for leaf in jax.tree_util.tree_leaves(kwargs))
+
+        jaxpr = closed_jaxpr.jaxpr
+
+        result = lora_interpreter(jaxpr, closed_jaxpr.literals, *paired_args)
         unflattened_result = jax.tree_util.tree_unflatten(out_structure, result)
 
         return unflattened_result
@@ -153,8 +106,8 @@ def materialize_val(val):
 def is_lora_tuple(val):
     return isinstance(val, tuple) and isinstance(val[1], LoraNode)
 
-def lora_interpreter(jaxpr, args, literals):
-    env = dict(args)
+def lora_interpreter(jaxpr, literals, *args):
+    env = {}
 
     def read(var):
         if isinstance(var, jax.core.Literal):
@@ -165,14 +118,7 @@ def lora_interpreter(jaxpr, args, literals):
         env[var] = val
 
     safe_map(write, jaxpr.constvars, literals)
-
-
-    lora_fns = {
-        'dot_general': eval_lora,
-        'conv_general_dilated': eval_lora_conv,
-        'gather': eval_lora_gather,
-        'transpose': eval_lora_transpose
-    }
+    safe_map(write, jaxpr.invars, args)
 
     for eqn in jaxpr.eqns:
         # TODO: run inside other interpreters in a smarter way
@@ -184,22 +130,19 @@ def lora_interpreter(jaxpr, args, literals):
             pjit_jaxpr = params.pop('jaxpr')
             literals = pjit_jaxpr.literals
             subjaxpr = pjit_jaxpr.jaxpr
-            sub_fn_inputs = {name: val for name, val in zip(subjaxpr.invars, args)}
-
             ans = jax.experimental.pjit.pjit(
                 partial(lora_interpreter, subjaxpr),
-            )(sub_fn_inputs, literals)
+            )(literals, *args)
             use_default_eval = False
         elif eqn.primitive.name == 'remat2':
             subjaxpr = eqn.params['jaxpr']
-            sub_fn_inputs = {name: val for name, val in zip(subjaxpr.invars, args)}
             ans = jax.remat(
                 partial(lora_interpreter, subjaxpr)
-            )(sub_fn_inputs, [])
+            )([], *args)
             use_default_eval = False
-        elif eqn.primitive.name in lora_fns:
+        elif eqn.primitive.name in LORA_IMPLS:
             if any(safe_map(is_lora_tuple, args)):
-                ans = lora_fns[eqn.primitive.name](eqn, *args)
+                ans = LORA_IMPLS[eqn.primitive.name](eqn, *args)
                 use_default_eval = ans is None
 
         if use_default_eval:
@@ -211,7 +154,15 @@ def lora_interpreter(jaxpr, args, literals):
 
     return safe_map(read, jaxpr.outvars)
 
-def eval_lora(eqn, lhs, rhs):
+def _reversed_dot(lhs, rhs, dimension_numbers):
+    return jax.lax.dot_general(
+        rhs,
+        lhs,
+        dimension_numbers
+
+    )
+
+def eval_lora_dot(eqn, lhs, rhs):
     dimension_numbers = eqn.params['dimension_numbers']
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
     if lhs_batch or rhs_batch:
@@ -221,6 +172,9 @@ def eval_lora(eqn, lhs, rhs):
         warnings.warn('Lorax only supports matmul')
         return None
 
+    lhs_contract, = lhs_contract
+    rhs_contract, = rhs_contract
+
     use_lhs = is_lora_tuple(lhs)
 
     use_rhs = is_lora_tuple(rhs)
@@ -229,17 +183,31 @@ def eval_lora(eqn, lhs, rhs):
         use_rhs = False
 
     if use_lhs:
-        a_first = lhs_contract[0] == 1
+        a_first = lhs_contract == 1
         fixed_arg = materialize_val(rhs)
         frozen, lora = lhs
+        fn = jax.lax.dot_general
+
+        second_dimension_numbers = (
+            ((lhs_contract,), (0,)),
+            dimension_numbers[1]
+        )
+
     elif use_rhs:
-        a_first = rhs_contract[0] == 1
+        a_first = rhs_contract == 1
         fixed_arg = materialize_val(lhs)
         frozen, lora = rhs
+        fn = _reversed_dot
+
+        final_lhs_dim = len(fixed_arg.shape) - 1
+
+        second_dimension_numbers = (
+            ((final_lhs_dim,), (rhs_contract,)),
+            dimension_numbers[1]
+        )
     else:
         raise ValueError('No lora node')
 
-    fn = jax.lax.dot_general if use_lhs else reversed_dot
     orig_product = fn(
         frozen,
         fixed_arg,
@@ -256,7 +224,7 @@ def eval_lora(eqn, lhs, rhs):
     lora_product = fn(
         second,
         lora_product,
-        dimension_numbers=dimension_numbers
+        dimension_numbers=second_dimension_numbers
     )
     return orig_product + lora_product
 
@@ -336,3 +304,10 @@ def eval_lora_transpose(eqn, arg):
     frozen_T = frozen.T
     lora_T = LoraNode(lora.b.T, lora.a.T)
     return frozen_T, lora_T
+
+LORA_IMPLS.update({
+    'dot_general': eval_lora_dot,
+    'conv_general_dilated': eval_lora_conv,
+    'gather': eval_lora_gather,
+    'transpose': eval_lora_transpose
+})
