@@ -1,8 +1,8 @@
 import jax
 from jax.tree_util import tree_map_with_path, DictKey
 
-from lorax.constants import LORA_FREEZE, LORA_FULL
-from lorax.transform import EmptyNode
+from .constants import LORA_FREEZE, LORA_FULL
+from .transform import EmptyNode, LoraNode, custom_tree_map
 
 def simple_spec(params, decision_fn=None, tune_vectors=False):
     """
@@ -34,10 +34,14 @@ def merge_params(frozen_params, tunable_params, destructive=True):
     def merge(frozen, tunable):
         if tunable is EmptyNode:
             return frozen
-        elif frozen is EmptyNode:
+        if frozen is EmptyNode:
             return tunable
         new_param = frozen + tunable.b @ tunable.a
         if destructive:
             frozen.device_buffer.delete()
         return new_param
-    return jax.tree_map(merge, frozen_params, tunable_params)
+    return custom_tree_map(
+        merge,
+        frozen_params,
+        tunable_params,
+    )

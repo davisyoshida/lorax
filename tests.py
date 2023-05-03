@@ -80,6 +80,17 @@ def test_simple():
 
     assert jnp.allclose(perturbed_lora, combined_output, rtol=1e-4)
 
+def test_right_matmul(simple_params):
+    w, _, lora_params = simple_params
+    x = jax.random.normal(jax.random.PRNGKey(3), (10, w.shape[0]))
+    def f(w, x):
+        return x @ w
+
+    lora_f = lora(f)
+    lora_result = lora_f(lora_params, x)
+
+    assert jnp.allclose(lora_result, x @ w, atol=1e-4)
+
 def test_conv():
     key, a_key, b_key = jax.random.split(jax.random.PRNGKey(18), 3)
     batch = 7
@@ -186,6 +197,18 @@ def test_remat(simple_params):
     f = jax.remat(f)
     lora_f = jax.jit(lora(f))
 
+    expected = f(w, x)
+    res = lora_f(lora_params, x)
+    assert jnp.allclose(expected, res, rtol=1e-4)
+
+def test_transpose(simple_params):
+    w, x, lora_params = simple_params
+    def f(w, x):
+        return x.T @ w.T
+
+    lora_f = jax.jit(lora(f))
+
+    print(f'Lora param shape: {lora_params[1].a.shape} {lora_params[1].b.shape}')
     expected = f(w, x)
     res = lora_f(lora_params, x)
     assert jnp.allclose(expected, res, rtol=1e-4)

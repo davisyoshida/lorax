@@ -40,6 +40,7 @@ jax.tree_util.register_pytree_node(EmptyNodeCls, lambda _: ((), None), lambda _,
 
 def leaf_pred(x):
     return x is EmptyNode or isinstance(x, LoraNode)
+
 custom_tree_map = partial(jax.tree_util.tree_map, is_leaf=leaf_pred)
 custom_tree_leaves = partial(jax.tree_util.tree_leaves, is_leaf=leaf_pred)
 
@@ -136,205 +137,202 @@ def lora(f, argnums=0):
         return unflattened_result
     return wrapper
 
+def materialize_val(val):
+    if not isinstance(val, tuple):
+        return val
+
+    freeze, tune = val
+    if freeze is EmptyNode:
+        return tune
+    if tune is EmptyNode:
+        return freeze
+    full = freeze + tune.b @ tune.a
+    warnings.warn(f'LoRA matrix of shape {full.shape} was materialized')
+    return full
+
+def is_lora_tuple(val):
+    return isinstance(val, tuple) and isinstance(val[1], LoraNode)
+
 def lora_interpreter(jaxpr, args, literals):
-    env = {}
+    env = dict(args)
 
     def read(var):
         if isinstance(var, jax.core.Literal):
             return var.val
-        if var in env:
-            return env[var]
-        value = args[var]
-        if not isinstance(value, tuple):
-            return value
-
-        freeze, tune = value
-        if freeze is EmptyNode:
-            return tune
-        if tune is EmptyNode:
-            return freeze
-
-        warnings.warn('LoRA matrix was materialized')
-        return tune.b @ tune.a + freeze
+        return env[var]
 
     def write(var, val):
         env[var] = val
 
     safe_map(write, jaxpr.constvars, literals)
 
-    def eval_lora(eqn):
-        lhs = eqn.invars[0]
-        rhs = eqn.invars[1]
-        if not any(arg in args and isinstance(args[arg][1], LoraNode) for arg in (lhs, rhs)):
-            return None
 
-        dimension_numbers = eqn.params['dimension_numbers']
-        (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
-        if lhs_batch or rhs_batch:
-            warnings.warn('Lorax does not support batched matmuls')
-            return None
-        if len(lhs_contract) != 1 or len(rhs_contract) != 1:
-            warnings.warn('Lorax only supports matmul')
-            return None
-
-        lhs_arg = args.get(lhs)
-        if isinstance(lhs_arg, tuple):
-            frozen, lora = lhs_arg
-            use_lhs = isinstance(lora, LoraNode)
-        else:
-            use_lhs = False
-
-        rhs_arg = args.get(rhs)
-        if isinstance(rhs_arg, tuple):
-            use_rhs = isinstance(rhs_arg[1], LoraNode)
-            if use_rhs:
-                if use_lhs:
-                    warnings.warn('Product of two LoRA matrices is not implemented so RHS was materialized')
-                    use_rhs = False
-                else:
-                    frozen, lora = rhs_arg
-
-        a_first = lhs_contract[0] == 1
-        if use_lhs:
-            fixed_arg = read(rhs)
-        elif use_rhs:
-            fixed_arg = read(lhs)
-        else:
-            raise ValueError('No lora node')
-
-
-        fn = jax.lax.dot_general if use_lhs else reversed_dot
-        orig_product = fn(
-            frozen,
-            fixed_arg,
-            dimension_numbers=dimension_numbers
-        )
-
-        first, second = (lora.a, lora.b) if a_first else (lora.b, lora.a)
-        lora_product = fn(
-            first,
-            fixed_arg,
-            dimension_numbers=dimension_numbers
-        )
-
-        lora_product = fn(
-            second,
-            lora_product,
-            dimension_numbers=dimension_numbers
-        )
-        return orig_product + lora_product
-
-    def eval_lora_conv(eqn):
-        inp = read(eqn.invars[0])
-        kernel = eqn.invars[1]
-        if not (kernel in args and isinstance(args[kernel][1], LoraNode)):
-            return None
-        dimension_numbers = eqn.params['dimension_numbers']
-        if not dimension_numbers.rhs_spec[:1] != (
-            len(dimension_numbers.rhs_spec) - 1,
-            len(dimension_numbers.rhs_spec) - 2,
-        ):
-            raise ValueError('Lorax only supports convolutions with shape (..., in_features, out_features)')
-
-        frozen, lora = args[kernel]
-        orig = jax.lax.conv_general_dilated(
-            inp,
-            frozen,
-            **eqn.params
-        )
-
-        kwargs = eqn.params.copy()
-        lora_product = jax.lax.conv_general_dilated(
-            inp,
-            lora.b,
-            **kwargs
-        )
-
-        kwargs['window_strides'] = (1,) * (len(dimension_numbers.rhs_spec) - 2)
-        kwargs['padding'] = 'VALID'
-        lora_product = jax.lax.conv_general_dilated(
-            lora_product,
-            lora.a,
-            **kwargs
-        )
-        return orig + lora_product
-
-    def eval_lora_gather(eqn):
-        arr = eqn.invars[0]
-        if not (arr in args and isinstance(args[arr][1], LoraNode)):
-            return None
-
-        indices = read(eqn.invars[1])
-
-        dimension_numbers = eqn.params['dimension_numbers']
-        if dimension_numbers.offset_dims != (len(indices.shape) - 1,):
-            return None
-
-        frozen, lora = args[arr]
-        constraint_dim = lora.b.shape[-1]
-
-        slice_sizes = eqn.params['slice_sizes']
-
-        if slice_sizes != (1, lora.a.shape[1]):
-            return None
-
-        new_params = eqn.params.copy()
-        new_params['slice_sizes'] = (1, constraint_dim)
-
-
-        orig = jax.lax.gather(frozen, indices, **eqn.params)
-
-        lora_product = jax.lax.gather(lora.b, indices, **new_params)
-
-        lora_product = lora_product @ lora.a
-        return orig + lora_product
-
-    def get_args_for_sub_fn(eqn_invars, jaxpr_invars):
-        result = {}
-        for outer_arg, inner_arg in zip(eqn_invars, jaxpr_invars):
-            if outer_arg in env:
-                result[inner_arg] = env[outer_arg]
-            else:
-                result[inner_arg] = args[outer_arg]
-
-        return result
+    lora_fns = {
+        'dot_general': eval_lora,
+        'conv_general_dilated': eval_lora_conv,
+        'gather': eval_lora_gather,
+        'transpose': eval_lora_transpose
+    }
 
     for eqn in jaxpr.eqns:
         # TODO: run inside other interpreters in a smarter way
-        used_lora = False
+        use_default_eval = True
         subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+        args = safe_map(read, eqn.invars)
         if eqn.primitive.name == 'pjit' and eqn.params['name'] == '_einsum':
             params = dict(eqn.params)
             pjit_jaxpr = params.pop('jaxpr')
             literals = pjit_jaxpr.literals
             subjaxpr = pjit_jaxpr.jaxpr
-            sub_fn_inputs = get_args_for_sub_fn(eqn.invars, subjaxpr.invars)
+            sub_fn_inputs = {name: val for name, val in zip(subjaxpr.invars, args)}
 
             ans = jax.experimental.pjit.pjit(
                 partial(lora_interpreter, subjaxpr),
             )(sub_fn_inputs, literals)
-            used_lora = True
+            use_default_eval = False
         elif eqn.primitive.name == 'remat2':
-            sub_jaxpr = eqn.params['jaxpr']
-            sub_fn_inputs = get_args_for_sub_fn(eqn.invars, sub_jaxpr.invars)
+            subjaxpr = eqn.params['jaxpr']
+            sub_fn_inputs = {name: val for name, val in zip(subjaxpr.invars, args)}
             ans = jax.remat(
-                partial(lora_interpreter, sub_jaxpr)
+                partial(lora_interpreter, subjaxpr)
             )(sub_fn_inputs, [])
-            used_lora = True
-        elif eqn.primitive.name == 'dot_general':
-            ans = eval_lora(eqn)
-            used_lora = ans is not None
-        elif eqn.primitive.name == 'conv_general_dilated':
-            ans = eval_lora_conv(eqn)
-            used_lora = ans is not None
-        elif eqn.primitive.name == 'gather':
-            ans = eval_lora_gather(eqn)
-            used_lora = ans is not None
+            use_default_eval = False
+        elif eqn.primitive.name in lora_fns:
+            if any(safe_map(is_lora_tuple, args)):
+                ans = lora_fns[eqn.primitive.name](eqn, *args)
+                use_default_eval = ans is None
 
-        if not used_lora:
-            ans = eqn.primitive.bind(*subfuns, *map(read, eqn.invars), **bind_params)
+        if use_default_eval:
+            materialized_args = safe_map(materialize_val, args)
+            ans = eqn.primitive.bind(*subfuns, *materialized_args, **bind_params)
         if not eqn.primitive.multiple_results:
             ans = [ans]
         safe_map(write, eqn.outvars, ans)
 
     return safe_map(read, jaxpr.outvars)
+
+def eval_lora(eqn, lhs, rhs):
+    dimension_numbers = eqn.params['dimension_numbers']
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+    if lhs_batch or rhs_batch:
+        warnings.warn('Lorax does not support batched matmuls')
+        return None
+    if len(lhs_contract) != 1 or len(rhs_contract) != 1:
+        warnings.warn('Lorax only supports matmul')
+        return None
+
+    use_lhs = is_lora_tuple(lhs)
+
+    use_rhs = is_lora_tuple(rhs)
+    if use_lhs and use_rhs:
+        warnings.warn('Product of two LoRA matrices is not implemented so RHS will be materialized')
+        use_rhs = False
+
+    if use_lhs:
+        a_first = lhs_contract[0] == 1
+        fixed_arg = materialize_val(rhs)
+        frozen, lora = lhs
+    elif use_rhs:
+        a_first = rhs_contract[0] == 1
+        fixed_arg = materialize_val(lhs)
+        frozen, lora = rhs
+    else:
+        raise ValueError('No lora node')
+
+    fn = jax.lax.dot_general if use_lhs else reversed_dot
+    orig_product = fn(
+        frozen,
+        fixed_arg,
+        dimension_numbers=dimension_numbers
+    )
+
+    first, second = (lora.a, lora.b) if a_first else (lora.b, lora.a)
+    lora_product = fn(
+        first,
+        fixed_arg,
+        dimension_numbers=dimension_numbers
+    )
+
+    lora_product = fn(
+        second,
+        lora_product,
+        dimension_numbers=dimension_numbers
+    )
+    return orig_product + lora_product
+
+def eval_lora_conv(eqn, inp, kernel):
+    if not is_lora_tuple(kernel):
+        return None
+
+    if is_lora_tuple(inp):
+        warnings.warn('Lorax only supports convolutions with the a LoRA kernel, so the input will be materialized')
+
+    inp = materialize_val(inp)
+
+    dimension_numbers = eqn.params['dimension_numbers']
+    if not dimension_numbers.rhs_spec[:1] != (
+        len(dimension_numbers.rhs_spec) - 1,
+        len(dimension_numbers.rhs_spec) - 2,
+    ):
+        raise ValueError('Lorax only supports convolutions with shape (..., in_features, out_features)')
+
+    frozen, lora = kernel
+    orig = jax.lax.conv_general_dilated(
+        inp,
+        frozen,
+        **eqn.params
+    )
+
+    kwargs = eqn.params.copy()
+    lora_product = jax.lax.conv_general_dilated(
+        inp,
+        lora.b,
+        **kwargs
+    )
+
+    kwargs['window_strides'] = (1,) * (len(dimension_numbers.rhs_spec) - 2)
+    kwargs['padding'] = 'VALID'
+    lora_product = jax.lax.conv_general_dilated(
+        lora_product,
+        lora.a,
+        **kwargs
+    )
+    return orig + lora_product
+
+def eval_lora_gather(eqn, arr, indices):
+    if not is_lora_tuple(arr):
+        return None
+
+    indices = materialize_val(indices)
+
+    dimension_numbers = eqn.params['dimension_numbers']
+    if dimension_numbers.offset_dims != (len(indices.shape) - 1,):
+        return None
+
+    frozen, lora = arr
+    constraint_dim = lora.b.shape[-1]
+
+    slice_sizes = eqn.params['slice_sizes']
+
+    if slice_sizes != (1, lora.a.shape[1]):
+        return None
+
+    new_params = eqn.params.copy()
+    new_params['slice_sizes'] = (1, constraint_dim)
+
+
+    orig = jax.lax.gather(frozen, indices, **eqn.params)
+
+    lora_product = jax.lax.gather(lora.b, indices, **new_params)
+
+    lora_product = lora_product @ lora.a
+    return orig + lora_product
+
+def eval_lora_transpose(eqn, arg):
+    if not len(arg[0].shape) == 2 and eqn.params['permutation'] == (1, 0):
+        return None
+    frozen, lora = arg
+
+    frozen_T = frozen.T
+    lora_T = LoraNode(lora.b.T, lora.a.T)
+    return frozen_T, lora_T
