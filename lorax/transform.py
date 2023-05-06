@@ -5,6 +5,7 @@ import warnings
 
 import jax
 from jax import api_util
+import jax.experimental.pjit
 import jax.linear_util as lu
 import jax.numpy as jnp
 from  jax.util import safe_map
@@ -14,26 +15,34 @@ from .constants import LORA_FREEZE, LORA_FULL
 LORA_IMPLS = {}
 
 class LoraNode:
-    def __init__(self, a, b):
+    def __init__(self, a, b, alpha=1.):
         self.a = a
         self.b = b
+        self.alpha = alpha
 
     def __str__(self):
-        return f'{type(self).__name__}(a={self.a}, b={self.b})'
+        return f'{type(self).__name__}(a={self.a}, b={self.b}, alpha={self.alpha})'
 
     def __repr__(self):
         return str(self)
 
-    def evaluate(self):
-        return self.b @ self.a
+    def evaluate(self, rescale=True):
+        result = self.b @ self.a
+        if rescale:
+            result *= self.get_scale()
+        return result
+
+    def get_scale(self):
+        return self.alpha / self.b.shape[1]
+
 
 class EmptyNodeCls:
     pass
 
 jax.tree_util.register_pytree_node(
     LoraNode,
-    lambda node: ((node.a, node.b), None),
-    lambda _, xs: LoraNode(*xs)
+    lambda node: ((node.a, node.b), node.alpha),
+    lambda alpha, xs: LoraNode(*xs, alpha=alpha)
 )
 
 EmptyNode = EmptyNodeCls()
@@ -50,7 +59,7 @@ def lora_to_orig(freeze_param, tune_param):
         return tune_param
     return freeze_param
 
-def lora(f, argnums=0):
+def lora(f, argnums=0, use_scaling=True):
     if isinstance(argnums, int):
         argnums = (argnums,)
 
@@ -84,13 +93,13 @@ def lora(f, argnums=0):
 
         jaxpr = closed_jaxpr.jaxpr
 
-        result = lora_interpreter(jaxpr, closed_jaxpr.literals, *paired_args)
+        result = lora_interpreter(jaxpr, closed_jaxpr.literals, *paired_args, use_scaling=use_scaling)
         unflattened_result = jax.tree_util.tree_unflatten(out_structure, result)
 
         return unflattened_result
     return wrapper
 
-def materialize_val(val):
+def materialize_val(val, use_scaling=True):
     if not isinstance(val, tuple):
         return val
 
@@ -99,14 +108,14 @@ def materialize_val(val):
         return tune
     if tune is EmptyNode:
         return freeze
-    full = freeze + tune.b @ tune.a
+    full = freeze + tune.evaluate(rescale=use_scaling)
     warnings.warn(f'LoRA matrix of shape {full.shape} was materialized')
     return full
 
 def is_lora_tuple(val):
     return isinstance(val, tuple) and isinstance(val[1], LoraNode)
 
-def lora_interpreter(jaxpr, literals, *args):
+def lora_interpreter(jaxpr, literals, *args, use_scaling=True):
     env = {}
 
     def read(var):
@@ -142,11 +151,11 @@ def lora_interpreter(jaxpr, literals, *args):
             use_default_eval = False
         elif eqn.primitive.name in LORA_IMPLS:
             if any(safe_map(is_lora_tuple, args)):
-                ans = LORA_IMPLS[eqn.primitive.name](eqn, *args)
+                ans = LORA_IMPLS[eqn.primitive.name](eqn, *args, use_scaling=use_scaling)
                 use_default_eval = ans is None
 
         if use_default_eval:
-            materialized_args = safe_map(materialize_val, args)
+            materialized_args = safe_map(partial(materialize_val, use_scaling=use_scaling), args)
             ans = eqn.primitive.bind(*subfuns, *materialized_args, **bind_params)
         if not eqn.primitive.multiple_results:
             ans = [ans]
@@ -162,7 +171,7 @@ def _reversed_dot(lhs, rhs, dimension_numbers):
 
     )
 
-def eval_lora_dot(eqn, lhs, rhs):
+def eval_lora_dot(eqn, lhs, rhs, use_scaling=True):
     dimension_numbers = eqn.params['dimension_numbers']
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
     if lhs_batch or rhs_batch:
@@ -184,7 +193,7 @@ def eval_lora_dot(eqn, lhs, rhs):
 
     if use_lhs:
         a_first = lhs_contract == 1
-        fixed_arg = materialize_val(rhs)
+        fixed_arg = materialize_val(rhs, use_scaling=use_scaling)
         frozen, lora = lhs
         fn = jax.lax.dot_general
 
@@ -195,7 +204,7 @@ def eval_lora_dot(eqn, lhs, rhs):
 
     elif use_rhs:
         a_first = rhs_contract == 1
-        fixed_arg = materialize_val(lhs)
+        fixed_arg = materialize_val(lhs, use_scaling=use_scaling)
         frozen, lora = rhs
         fn = _reversed_dot
 
@@ -226,9 +235,11 @@ def eval_lora_dot(eqn, lhs, rhs):
         lora_product,
         dimension_numbers=second_dimension_numbers
     )
+    if use_scaling:
+        lora_product *= lora.get_scale()
     return orig_product + lora_product
 
-def eval_lora_conv(eqn, inp, kernel):
+def eval_lora_conv(eqn, inp, kernel, use_scaling=True):
     if not is_lora_tuple(kernel):
         return None
 
@@ -265,9 +276,12 @@ def eval_lora_conv(eqn, inp, kernel):
         lora.a,
         **kwargs
     )
+
+    if use_scaling:
+        lora_product *= lora.get_scale()
     return orig + lora_product
 
-def eval_lora_gather(eqn, arr, indices):
+def eval_lora_gather(eqn, arr, indices, use_scaling=True):
     if not is_lora_tuple(arr):
         return None
 
@@ -294,15 +308,18 @@ def eval_lora_gather(eqn, arr, indices):
     lora_product = jax.lax.gather(lora.b, indices, **new_params)
 
     lora_product = lora_product @ lora.a
+    if use_scaling:
+        lora_product *= lora.get_scale()
+
     return orig + lora_product
 
-def eval_lora_transpose(eqn, arg):
+def eval_lora_transpose(eqn, arg, **kwargs):
     if not len(arg[0].shape) == 2 and eqn.params['permutation'] == (1, 0):
         return None
     frozen, lora = arg
 
     frozen_T = frozen.T
-    lora_T = LoraNode(lora.b.T, lora.a.T)
+    lora_T = LoraNode(lora.b.T, lora.a.T, alpha=lora.alpha)
     return frozen_T, lora_T
 
 LORA_IMPLS.update({

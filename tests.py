@@ -15,12 +15,17 @@ def simple_params():
 
     a = jax.random.normal(jax.random.PRNGKey(1), (rank_constraint, n))
     b = jax.random.normal(jax.random.PRNGKey(2), (m, rank_constraint))
-    w = b @ a
     lora_params = (
         jnp.zeros((m, n)),
         LoraNode(a, b)
     )
+    w = lora_params[1].evaluate()
     return w, x, lora_params
+
+def test_evaluate(simple_params):
+    _, _, lora_params = simple_params
+    lora_node = lora_params[1]
+    assert jnp.allclose(lora_node.evaluate(), lora_node.b @ lora_node.a / lora_node.b.shape[1])
 
 def test_prepare():
     w_shape = 3, 4
@@ -79,7 +84,8 @@ def test_simple():
     combined_params = merge_params(*lora_params)
     combined_output = f(combined_params, x)
 
-    assert jnp.allclose(perturbed_lora, combined_output, rtol=1e-4)
+    print(f'Gap: {jnp.abs(combined_output - perturbed_lora).max()}')
+    assert jnp.allclose(perturbed_lora, combined_output, atol=1e-5)
 
 def test_right_matmul(simple_params):
     w, _, lora_params = simple_params
@@ -118,12 +124,11 @@ def test_conv():
     a = jax.random.normal(b_key, (1, rank_constraint, output))
     b = jax.random.normal(a_key, (window_size, hidden, rank_constraint))
 
-    w = b @ a
-
     lora_params = (
         jnp.zeros((window_size, hidden, output)),
         LoraNode(a, b)
     )
+    w = lora_params[1].evaluate()
 
     lora_fn = lora(fn)
     orig_result = fn(w, x)
@@ -160,12 +165,11 @@ def test_embedding():
             slice_sizes=(1, hidden)
         )
 
-    w = b @ a
-    jaxpr = jax.make_jaxpr(f)(w, ids)
     lora_params = (
         jnp.zeros((vocab, hidden)),
         LoraNode(a, b)
     )
+    w = lora_params[1].evaluate()
 
     lora_f = lora(f)
 
