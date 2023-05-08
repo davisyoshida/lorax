@@ -1,11 +1,9 @@
 from itertools import product
-import re
+import warnings
 
-import haiku as hk
 import jax
 import jax.numpy as jnp
 import pytest
-import warnings
 
 from lorax import merge_params, lora, init_lora
 from lorax.constants import LORA_FULL, LORA_FREEZE
