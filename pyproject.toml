@@ -1,0 +1,22 @@
+[tool.poetry]
+name = 'jax-lorax'
+version = '0.1.0'
+description = 'A JAX transform which applies LoRA to arbitrary JAX functions/models'
+authors = ['Davis Yoshida <dyoshida@ttic.edu>']
+license = 'MIT'
+readme = 'README.md'
+packages = [
+    {include = 'lorax'}
+]
+
+[tool.poetry.dependencies]
+python = '^3.8'
+jax = '^0.4.6'
+jaxlib = '^0.4.6'
+
+[tool.poetry.dev-dependencies]
+pytest = '^7.3.1'
+
+[build-system]
+requires = ['poetry-core>=1.0.0']
+build-backend = 'poetry.core.masonry.api'
