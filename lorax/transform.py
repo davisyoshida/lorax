@@ -8,6 +8,7 @@ from jax import api_util
 import jax.experimental.pjit
 import jax.linear_util as lu
 import jax.numpy as jnp
+from jax._src.lax.lax import _convert_element_type
 from  jax.util import safe_map
 
 from .constants import LORA_FREEZE, LORA_FULL
@@ -322,9 +323,20 @@ def eval_lora_transpose(eqn, arg, **kwargs):
     lora_T = LoraNode(lora.b.T, lora.a.T, alpha=lora.alpha)
     return frozen_T, lora_T
 
+def eval_lora_convert_element_type(eqn, arg, **kwargs):
+    lora_node = arg[1]
+    frozen = _convert_element_type(arg[0], **eqn.params)
+
+    a = _convert_element_type(lora_node.a, **eqn.params)
+    b = _convert_element_type(lora_node.b, **eqn.params)
+
+    return frozen, LoraNode(a, b, alpha=lora_node.alpha)
+
+
 LORA_IMPLS.update({
     'dot_general': eval_lora_dot,
     'conv_general_dilated': eval_lora_conv,
     'gather': eval_lora_gather,
-    'transpose': eval_lora_transpose
+    'transpose': eval_lora_transpose,
+    'convert_element_type': eval_lora_convert_element_type
 })

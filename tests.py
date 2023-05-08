@@ -1,12 +1,19 @@
 from itertools import product
+import re
+
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import pytest
+import warnings
 
 from lorax import merge_params, lora, init_lora
 from lorax.constants import LORA_FULL, LORA_FREEZE
 from lorax.transform import LoraNode, EmptyNode
+
+@pytest.fixture(autouse=True)
+def catch_materialization_warnings(recwarn):
+    warnings.filterwarnings('error', message='LoRA matrix.*materialized')
 
 @pytest.fixture
 def simple_params():
@@ -257,11 +264,25 @@ def test_dot_contraction(simple_params, lora_first, contract_lora, contract_x, x
     print(f'Gap: {jnp.max(jnp.abs(expected - lora_result)):.3e}')
     assert jnp.allclose(expected, lora_result, atol=1e-5)
 
+def test_cast(simple_params):
+    w, x, lora_params = simple_params
+    def f(w, x):
+        return w.astype(jnp.float16) @ x.astype(jnp.float16)
+
+    lora_f = lora(f)
+
+    expected = f(w, x)
+    res = lora_f(lora_params, x)
+
+    print(f'Gap: {jnp.max(jnp.abs(expected - res)):.3e}')
+    assert jnp.allclose(expected, res, atol=3e-3)
+
+
 
 def test_warning(simple_params):
     _, _, lora_params = simple_params
     def f(w):
-        return w + w
+        return w[:10, 3:]
 
     lora_f = lora(f)
 
