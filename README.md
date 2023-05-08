@@ -6,9 +6,21 @@ Lorax should work on most JAX models. I did my testing with my models which use 
 ## Installation 
 
 ```bash
+pip install jax-lorax
+```
+
+### Running tests
+Install dev dependencies:
+```bash
 git clone https://github.com/davisyoshida/lorax.git
 cd lorax
-pip install -e .
+pip install poetry
+poetry install
+```
+
+Run tests:
+```
+pytest tests.py
 ```
 
 ## Minimal example
