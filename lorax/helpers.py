@@ -22,7 +22,6 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32, alpha=1., i
         if len(param.shape) == 2:
             b_dim, a_dim = param.shape
 
-            print(f'b_dim: {b_dim}, a_dim: {a_dim}, spec_val: {spec_val}')
             b = jnp.zeros((b_dim, spec_val), dtype=param.dtype)
             a = jax.random.normal(rng, (spec_val, a_dim), dtype=param.dtype) * stddev
             return LoraNode(a, b, alpha=alpha)
