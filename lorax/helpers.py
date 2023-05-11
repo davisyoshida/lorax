@@ -5,7 +5,7 @@ from jax.tree_util import tree_map_with_path, DictKey, SequenceKey
 from .constants import LORA_FREEZE, LORA_FULL
 from .transform import EmptyNode, LoraNode, custom_tree_map
 
-def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32, alpha=1.):
+def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32, alpha=1., is_leaf=None):
     def freeze_getter(param, spec_val):
         if spec_val == LORA_FULL:
             return EmptyNode
@@ -22,12 +22,12 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32, alpha=1.):
         if len(param.shape) == 2:
             b_dim, a_dim = param.shape
 
+            print(f'b_dim: {b_dim}, a_dim: {a_dim}, spec_val: {spec_val}')
             b = jnp.zeros((b_dim, spec_val), dtype=param.dtype)
             a = jax.random.normal(rng, (spec_val, a_dim), dtype=param.dtype) * stddev
             return LoraNode(a, b, alpha=alpha)
 
         # conv case
-        print(path, param.shape)
         *window_shape, in_channels, out_channels = param.shape
 
         a = jnp.zeros((
@@ -38,9 +38,12 @@ def init_lora(param_tree, spec, rng, stddev=0.01, dtype=jnp.float32, alpha=1.):
         b = jax.random.normal(rng, (*window_shape, in_channels, spec_val), dtype=param.dtype) * stddev
         return LoraNode(a, b, alpha=alpha)
 
-    return jax.tree_map(freeze_getter, param_tree, spec), jax.tree_util.tree_map_with_path(tune_getter, param_tree, spec)
+    return (
+        jax.tree_map(freeze_getter, param_tree, spec, is_leaf=is_leaf),
+        jax.tree_util.tree_map_with_path(tune_getter, param_tree, spec, is_leaf=is_leaf)
+    )
 
-def simple_spec(params, decision_fn=None, tune_vectors=False):
+def simple_spec(params, decision_fn=None, tune_vectors=False, is_leaf=None):
     """
     Create a simple lora spec for a pytree
     Args:
@@ -71,7 +74,7 @@ def simple_spec(params, decision_fn=None, tune_vectors=False):
         value = decision_fn(path_str, arr)
         return value
 
-    return tree_map_with_path(full_fn, params)
+    return tree_map_with_path(full_fn, params, is_leaf=is_leaf)
 
 def merge_params(frozen_params, tunable_params, destructive=True, use_scaling=True):
     """Re-merge LoRA parameters.
