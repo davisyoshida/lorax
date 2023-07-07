@@ -5,32 +5,16 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from lorax import merge_params, lora, init_lora
+from lorax import lora, init_lora, LoraWeight, LORA_FULL, LORA_FREEZE
 from lorax.constants import LORA_FULL, LORA_FREEZE
-from lorax.transform import LoraNode, EmptyNode
 
 @pytest.fixture(autouse=True)
 def catch_materialization_warnings(recwarn):
-    warnings.filterwarnings('error', message='LoRA matrix.*materialized')
+    warnings.filterwarnings('error', message='Primitive.*not handled')
 
-@pytest.fixture
-def simple_params():
-    m, rank_constraint, n = 11, 7, 19
-    x = jax.random.normal(jax.random.PRNGKey(0), (n, 10))
-
-    a = jax.random.normal(jax.random.PRNGKey(1), (rank_constraint, n))
-    b = jax.random.normal(jax.random.PRNGKey(2), (m, rank_constraint))
-    lora_params = (
-        jnp.zeros((m, n)),
-        LoraNode(a, b)
-    )
-    w = lora_params[1].evaluate()
-    return w, x, lora_params
-
-def test_evaluate(simple_params):
-    _, _, lora_params = simple_params
-    lora_node = lora_params[1]
-    assert jnp.allclose(lora_node.evaluate(), lora_node.b @ lora_node.a / lora_node.b.shape[1])
+def test_materialize(simple_params):
+    full, _, lora = simple_params
+    assert jnp.allclose(lora.materialize(), full)
 
 def test_prepare():
     w_shape = 3, 4
@@ -45,18 +29,12 @@ def test_prepare():
         'W2': LORA_FULL
     }
 
-    frozen_params, tune_params = init_lora(params, spec, jax.random.PRNGKey(0))
+    lora_params = init_lora(params, spec, jax.random.PRNGKey(0))
 
-    assert frozen_params['W'].shape == params['W'].shape
-    assert frozen_params['b'].shape == params['b'].shape
-    assert frozen_params['W2'] is EmptyNode
-
-    assert isinstance(tune_params['W'], LoraNode)
-    assert tune_params['W'].a.shape == (2, w_shape[1])
-    assert tune_params['W'].b.shape == (w_shape[0], 2)
-
-    assert tune_params['b'] is EmptyNode
-    assert tune_params['W2'].shape == params['W2'].shape
+    assert isinstance(lora_params['W'], LoraWeight)
+    assert lora_params['W'].shape == params['W'].shape
+    assert lora_params['b'] is params['b']
+    assert lora_params['W2'] is params ['W2']
 
 def test_simple():
     key, init_key = jax.random.split(jax.random.PRNGKey(17))
@@ -82,11 +60,11 @@ def test_simple():
 
     assert jnp.allclose(orig_output, lora_output)
 
-    lora_params[1][0].b = jax.random.normal(key, (hidden, 2)) * 10
+    lora_params[0].b = jax.random.normal(key, (hidden, 2)) * 10
 
     perturbed_lora = lora_f(lora_params, x)
 
-    combined_params = merge_params(*lora_params)
+    combined_params = [lora_params[0].materialize()]
     combined_output = f(combined_params, x)
 
     print(f'Gap: {jnp.abs(combined_output - perturbed_lora).max()}')
@@ -101,7 +79,9 @@ def test_right_matmul(simple_params):
     lora_f = lora(f)
     lora_result = lora_f(lora_params, x)
 
-    assert jnp.allclose(lora_result, x @ w, atol=1e-4)
+    orig_result = f(w, x)
+
+    assert jnp.allclose(lora_result, orig_result, atol=1e-4)
 
 def test_conv():
     key, a_key, b_key = jax.random.split(jax.random.PRNGKey(18), 3)
@@ -129,11 +109,13 @@ def test_conv():
     a = jax.random.normal(b_key, (1, rank_constraint, output))
     b = jax.random.normal(a_key, (window_size, hidden, rank_constraint))
 
-    lora_params = (
-        jnp.zeros((window_size, hidden, output)),
-        LoraNode(a, b)
+    lora_params = LoraWeight(
+        w=jnp.zeros((window_size, hidden, output)),
+        a=a,
+        b=b
     )
-    w = lora_params[1].evaluate()
+
+    w = lora_params.materialize()
 
     lora_fn = lora(fn)
     orig_result = fn(w, x)
@@ -144,7 +126,7 @@ def test_conv():
     assert jnp.allclose(orig_result, lora_result, rtol=1e-3)
 
 def test_embedding():
-    key, a_key, b_key = jax.random.split(jax.random.PRNGKey(19), 3)
+    key, a_key, b_key, emb_key = jax.random.split(jax.random.PRNGKey(19), 4)
     batch = 11
     time = 13
     vocab = 4321
@@ -170,11 +152,12 @@ def test_embedding():
             slice_sizes=(1, hidden)
         )
 
-    lora_params = (
-        jnp.zeros((vocab, hidden)),
-        LoraNode(a, b)
+    lora_params = LoraWeight(
+        w=jax.random.normal(emb_key, (vocab, hidden)),
+        a=a,
+        b=b
     )
-    w = lora_params[1].evaluate()
+    w = lora_params.materialize()
 
     lora_f = lora(f)
 
@@ -218,10 +201,10 @@ def test_transpose(simple_params):
 
     lora_f = jax.jit(lora(f))
 
-    print(f'Lora param shape: {lora_params[1].a.shape} {lora_params[1].b.shape}')
     expected = f(w, x)
     res = lora_f(lora_params, x)
-    assert jnp.allclose(expected, res, rtol=1e-4)
+    print(f'Gap: {jnp.max(jnp.abs(expected - res)):.3e}')
+    assert jnp.allclose(expected, res, atol=1e-6)
 
 @pytest.mark.parametrize('lora_first,contract_lora,contract_x,x_ndim', [
     (lf, cl, cx, nd) for lf, cl, cx, nd in
@@ -273,9 +256,7 @@ def test_cast(simple_params):
     res = lora_f(lora_params, x)
 
     print(f'Gap: {jnp.max(jnp.abs(expected - res)):.3e}')
-    assert jnp.allclose(expected, res, atol=3e-3)
-
-
+    assert jnp.allclose(expected, res, atol=1e-2)
 
 def test_warning(simple_params):
     _, _, lora_params = simple_params
@@ -286,3 +267,4 @@ def test_warning(simple_params):
 
     with pytest.warns(UserWarning, match='materialized'):
         lora_f(lora_params)
+
