@@ -9,6 +9,12 @@ Lorax should work on most JAX models. I did my testing with my models which use 
 pip install jax-lorax
 ```
 
+## Changelog
+
+### 0.2.0
+* Replaced backend with [Qax](https://github.com/davisyoshida/qax)
+* Overhauled API to simplify usage (No more need to separately handle frozen/tunable params)
+
 ### Running tests
 Install dev dependencies:
 ```bash
