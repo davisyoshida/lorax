@@ -1,3 +1,4 @@
+from functools import partial
 import jax
 import jax.numpy as jnp
 
@@ -40,7 +41,7 @@ optimizer = lorax.wrap_optimizer(optimizer, lora_spec)
 # Now the optimizer can be used just like normal
 opt_state = optimizer.init(lora_params)
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(0, 1))
 def update_fn(lora_params, opt_state, x):
     # The transformed model function is compatible with all the normal JAX transforms
     # It's just a function which maps pytrees to pytrees
@@ -57,7 +58,7 @@ for i in range(10):
     print(f'Step: {i} loss: {loss:.4e}') # Number goes down!
 
 # Save the output to verify correctness
-lora_output = lora_model((frozen_params, tunable_params), x)
+lora_output = lora_model(lora_params, x)
 
 # Now we merge the params to get params usable in the original model
 merged_params = lorax.merge_params(lora_params)
