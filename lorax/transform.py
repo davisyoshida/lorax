@@ -30,7 +30,7 @@ class LoraWeight(qax.ImplicitArray):
         return (self.w + self.get_scale() * self.b @ self.a).astype(self.w.dtype)
 
     def get_scale(self):
-        return self.alpha / self.b.shape[1]
+        return self.alpha / self.b.shape[-1]
 
 def _check_dot_dimension_numbers(dimension_numbers):
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
